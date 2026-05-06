@@ -182,6 +182,50 @@ class AgentLoop:
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
 
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        bus: MessageBus | None = None,
+        **extra: Any,
+    ) -> AgentLoop:
+        """Create an AgentLoop from config with the common parameter set."""
+        from nanobot.providers.factory import build_provider_for_preset, make_provider_factory
+
+        if bus is None:
+            bus = MessageBus()
+        defaults = config.agents.defaults
+        resolved_preset = config.resolve_preset()
+        provider = build_provider_for_preset(config, resolved_preset)
+        return cls(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=resolved_preset.model,
+            max_iterations=defaults.max_tool_iterations,
+            context_window_tokens=resolved_preset.context_window_tokens,
+            context_block_limit=defaults.context_block_limit,
+            max_tool_result_chars=defaults.max_tool_result_chars,
+            provider_retry_mode=defaults.provider_retry_mode,
+            fallback_models=defaults.fallback_models,
+            provider_factory=make_provider_factory(config),
+            web_config=config.tools.web,
+            exec_config=config.tools.exec,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=defaults.timezone,
+            unified_session=defaults.unified_session,
+            disabled_skills=defaults.disabled_skills,
+            session_ttl_minutes=defaults.session_ttl_minutes,
+            consolidation_ratio=defaults.consolidation_ratio,
+            max_messages=defaults.max_messages,
+            tools_config=config.tools,
+            model_presets=config.model_presets,
+            model_preset=defaults.model_preset,
+            **extra,
+        )
+
     def __init__(
         self,
         bus: MessageBus,
@@ -222,7 +266,12 @@ class AgentLoop:
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
-        self.provider = provider
+        self.provider_factory = provider_factory
+        self.fallback_models = fallback_models or []
+        wrapped_provider = self._wrap_with_failover(
+            provider, model or provider.get_default_model()
+        )
+        self.provider = wrapped_provider
         self._provider_snapshot_loader = provider_snapshot_loader
         self._provider_signature = provider_signature
         self.workspace = workspace
@@ -246,7 +295,6 @@ class AgentLoop:
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
-        self.fallback_models = fallback_models or []
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -260,9 +308,9 @@ class AgentLoop:
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
-        self.runner = AgentRunner(provider, provider_factory=provider_factory)
+        self.runner = AgentRunner(wrapped_provider)
         self.subagents = SubagentManager(
-            provider=provider,
+            provider=wrapped_provider,
             workspace=workspace,
             bus=bus,
             model=self.model,
@@ -294,13 +342,13 @@ class AgentLoop:
         )
         self.consolidator = Consolidator(
             store=self.context.memory,
-            provider=provider,
+            provider=wrapped_provider,
             model=self.model,
             sessions=self.sessions,
             context_window_tokens=self.context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=provider.generation.max_tokens,
+            max_completion_tokens=wrapped_provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
         )
         self.auto_compact = AutoCompact(
@@ -310,11 +358,13 @@ class AgentLoop:
         )
         self.dream = Dream(
             store=self.context.memory,
-            provider=provider,
+            provider=wrapped_provider,
             model=self.model,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
-        self._active_preset: str | None = model_preset if model_presets and model_preset in model_presets else None
+        self._active_preset: str | None = (
+            model_preset if model_preset in self.model_presets else None
+        )
         self._register_default_tools()
         if _tc.my.enable:
             self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
@@ -327,6 +377,22 @@ class AgentLoop:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
 
+    def _wrap_with_failover(self, provider: LLMProvider, model: str) -> LLMProvider:
+        """Wrap provider with failover router when fallback_models are configured."""
+        if not self.fallback_models or not self.provider_factory:
+            return provider
+        from nanobot.providers.failover import ModelRouter
+
+        if isinstance(provider, ModelRouter):
+            return provider
+
+        return ModelRouter(
+            primary_provider=provider,
+            primary_model=model,
+            fallback_models=self.fallback_models,
+            provider_factory=self.provider_factory,
+        )
+
     def _apply_provider_snapshot(self, snapshot: ProviderSnapshot) -> None:
         """Swap model/provider for future turns without disturbing an active one."""
         provider = snapshot.provider
@@ -335,6 +401,7 @@ class AgentLoop:
         if self.provider is provider and self.model == model:
             return
         old_model = self.model
+        provider = self._wrap_with_failover(provider, model)
         self.provider = provider
         self.model = model
         self.context_window_tokens = context_window_tokens
@@ -343,6 +410,10 @@ class AgentLoop:
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature
+        if self._active_preset:
+            preset = self.model_presets.get(self._active_preset)
+            if preset and preset.model != model:
+                self._active_preset = None
         logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
 
     def _refresh_provider_snapshot(self) -> None:
@@ -364,23 +435,45 @@ class AgentLoop:
         return self._active_preset
 
     @model_preset.setter
-    def model_preset(self, name: str | None) -> None:
+    def model_preset(self, name: str) -> None:
         """Resolve a preset by name and apply all fields atomically."""
-        from nanobot.providers.base import GenerationSettings
-
         if not isinstance(name, str) or not name.strip():
             raise ValueError("model_preset must be a non-empty string")
         if name not in self.model_presets:
-            raise KeyError(f"model_preset {name!r} not found. Available: {', '.join(self.model_presets) or '(none)'}")
+            raise KeyError(
+                f"model_preset {name!r} not found. Available: {', '.join(self.model_presets) or '(none)'}"
+            )
+        if self.provider_factory is None:
+            raise ValueError("provider_factory is not configured; cannot switch model preset")
+
         p = self.model_presets[name]
-        self.model = p.model
-        self.context_window_tokens = p.context_window_tokens
-        self.provider.generation = GenerationSettings(
-            temperature=p.temperature,
-            max_tokens=p.max_tokens,
-            reasoning_effort=p.reasoning_effort,
+        new_provider = self._wrap_with_failover(self.provider_factory(name), p.model)
+
+        # Snapshot current state so we can roll back on partial failure.
+        old_provider, old_model, old_ctx, old_preset = (
+            self.provider, self.model, self.context_window_tokens, self._active_preset,
         )
-        self._active_preset = name
+
+        try:
+            self.model = p.model
+            self.context_window_tokens = p.context_window_tokens
+            if new_provider is not self.provider:
+                self.provider = new_provider
+                self.runner.provider = new_provider
+                self.subagents.set_provider(new_provider, p.model)
+                self.consolidator.set_provider(new_provider, p.model, p.context_window_tokens)
+                self.dream.set_provider(new_provider, p.model)
+            self._active_preset = name
+        except Exception:
+            self.model = old_model
+            self.context_window_tokens = old_ctx
+            self.provider = old_provider
+            self.runner.provider = old_provider
+            self.subagents.set_provider(old_provider, old_model)
+            self.consolidator.set_provider(old_provider, old_model, old_ctx)
+            self.dream.set_provider(old_provider, old_model)
+            self._active_preset = old_preset
+            raise
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -429,7 +522,9 @@ class AgentLoop:
                     user_agent=self.web_config.user_agent,
                 )
             )
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
+        self.tools.register(
+            MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace)
+        )
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -459,8 +554,11 @@ class AgentLoop:
             self._mcp_connecting = False
 
     def _set_tool_context(
-        self, channel: str, chat_id: str,
-        message_id: str | None = None, metadata: dict | None = None,
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict | None = None,
         session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
@@ -482,7 +580,9 @@ class AgentLoop:
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
                     elif name == "cron":
-                        tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key)
+                        tool.set_context(
+                            channel, chat_id, metadata=metadata, session_key=session_key
+                        )
                     elif name == "message":
                         tool.set_context(channel, chat_id, message_id, metadata=metadata)
                     else:
@@ -641,9 +741,11 @@ class AgentLoop:
             # Block if nothing drained but sub-agents spawned in this dispatch
             # are still running.  Keeps the runner loop alive so subsequent
             # completions are injected in-order rather than dispatched separately.
-            if (not items
-                    and session is not None
-                    and self.subagents.get_running_count_by_session(session.key) > 0):
+            if (
+                not items
+                and session is not None
+                and self.subagents.get_running_count_by_session(session.key) > 0
+            ):
                 try:
                     msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
                 except asyncio.TimeoutError:
@@ -678,7 +780,6 @@ class AgentLoop:
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
-                fallback_models=self.fallback_models,
                 progress_callback=on_progress,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
@@ -696,7 +797,13 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+        return (
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            result.had_injections,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -726,7 +833,9 @@ class AgentLoop:
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
-                    msg, msg.session_key, raw,
+                    msg,
+                    msg.session_key,
+                    raw,
                     self.commands.dispatch_priority,
                 )
                 continue
@@ -739,7 +848,9 @@ class AgentLoop:
                 # dispatch them directly (same pattern as priority commands).
                 if self.commands.is_dispatchable_command(raw):
                     await self._dispatch_command_inline(
-                        msg, effective_key, raw,
+                        msg,
+                        effective_key,
+                        raw,
                         self.commands.dispatch,
                     )
                     continue
@@ -802,11 +913,14 @@ class AgentLoop:
                             meta = dict(msg.metadata or {})
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta,
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata=meta,
+                                )
+                            )
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
@@ -814,24 +928,33 @@ class AgentLoop:
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content="",
+                                    metadata=meta,
+                                )
+                            )
                             stream_segment += 1
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=msg.metadata or {},
+                            )
+                        )
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     # Preserve partial context from the interrupted turn so
@@ -860,10 +983,13 @@ class AgentLoop:
                     raise
                 except Exception:
                     logger.exception("Error processing message for session {}", session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        )
+                    )
         finally:
             # Drain any messages still in the pending queue and re-publish
             # them to the bus so they are processed as fresh inbound messages
@@ -881,7 +1007,8 @@ class AgentLoop:
                 if leftover:
                     logger.info(
                         "Re-published {} leftover message(s) to bus for session {}",
-                        leftover, session_key,
+                        leftover,
+                        session_key,
                     )
 
     async def close_mcp(self) -> None:
@@ -949,8 +1076,11 @@ class AgentLoop:
             if is_subagent and self._persist_subagent_followup(session, msg):
                 self.sessions.save(session)
             self._set_tool_context(
-                channel, chat_id, msg.metadata.get("message_id"),
-                msg.metadata, session_key=key,
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                msg.metadata,
+                session_key=key,
             )
             _hist_kwargs: dict[str, Any] = {
                 "max_messages": self._max_messages,
@@ -972,7 +1102,10 @@ class AgentLoop:
                 sender_id=msg.sender_id,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
-                messages, session=session, channel=channel, chat_id=chat_id,
+                messages,
+                session=session,
+                channel=channel,
+                chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 metadata=msg.metadata,
                 session_key=key,
@@ -1037,8 +1170,11 @@ class AgentLoop:
         )
 
         self._set_tool_context(
-            msg.channel, msg.chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata,
+            session_key=key,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1231,20 +1367,22 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                if isinstance(content, str) and content.startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
                     # Strip the entire runtime-context block (including any session summary).
                     # The block is bounded by _RUNTIME_CONTEXT_TAG and _RUNTIME_CONTEXT_END.
                     end_marker = ContextBuilder._RUNTIME_CONTEXT_END
                     end_pos = content.find(end_marker)
                     if end_pos >= 0:
-                        after = content[end_pos + len(end_marker):].lstrip("\n")
+                        after = content[end_pos + len(end_marker) :].lstrip("\n")
                         if after:
                             entry["content"] = after
                         else:
                             continue
                     else:
                         # Fallback: no end marker found, strip the tag prefix
-                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG):].lstrip("\n")
+                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG) :].lstrip("\n")
                         if after_tag.strip():
                             entry["content"] = after_tag
                         else:
@@ -1397,8 +1535,11 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
         )
         return await self._process_message(
             msg,
